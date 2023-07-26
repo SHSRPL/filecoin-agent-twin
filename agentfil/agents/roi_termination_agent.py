@@ -188,7 +188,7 @@ class ROIAgentDynamicOnboardandTerminate(SPAgent):
                  min_daily_rb_onboard_pib=3, max_daily_rb_onboard_pib=12,
                  min_renewal_rate = 0.3, max_renewal_rate = 0.8,
                  fil_plus_rate=0.6, 
-                 agent_optimism=4, min_roi=0.1, max_roi=0.3, debug_mode=False):
+                 agent_optimism=4, min_roi=0.1, max_roi=0.3, renewal_rate=0.6, sector_duration = 354, terminate_date=None, debug_mode=False):
         """
 
         debug_mode - if True, the agent will compute the power scheduled to be onboarded/renewed, but will not actually
@@ -197,6 +197,12 @@ class ROIAgentDynamicOnboardandTerminate(SPAgent):
         """
         # note that we dont set renewal_rate, roi_threshold since we use those terms differently in this agent
         super().__init__(model, id, historical_power, start_date, end_date, max_sealing_throughput_pib=max_sealing_throughput)
+
+        self.sector_duration = sector_duration
+        self.sector_duration_yrs = sector_duration / 365
+        self.renewal_rate = renewal_rate
+        self.fil_plus_rate = fil_plus_rate
+        self.terminate_date = terminate_date
 
         self.min_daily_rb_onboard_pib = min_daily_rb_onboard_pib
         self.max_daily_rb_onboard_pib = max_daily_rb_onboard_pib
@@ -294,29 +300,58 @@ class ROIAgentDynamicOnboardandTerminate(SPAgent):
         return roi_estimate_annualized
     ##########################################################################################
 
-    def estimate_roi_from_termination(self, date_in):     
+    def get_returns(self, sector_duration, date_in):
+        filecoin_df_idx = self.model.filecoin_df[pd.to_datetime(self.model.filecoin_df['date']) == pd.to_datetime(date_in)].index[0]
+        prev_day_pledge_per_QAP = self.model.filecoin_df.loc[filecoin_df_idx-1, 'day_pledge_per_QAP']
+        future_rewards_per_sector_estimate = self.forecast_day_rewards_per_sector(date_in, sector_duration)
+        return(future_rewards_per_sector_estimate).sum()
+
+    def get_termination_fee(self, date_in):
       terminate_date = self.current_date
-      assert terminate_date >= self.start_date
-      terminate_date_m1 = terminate_date - timedelta(days=1)
-    
-      agent_info_df_idx = self.agent_info_df[pd.to_datetime(self.agent_info_df['date']) == pd.to_datetime(terminate_date_m1)].index[0]
-      agent_at_terminate_date_stats = self.agent_info_df.loc[agent_info_df_idx]
+      rb_active_power, qa_active_power, termination_fee, associated_pledge_to_release, date_to_release = self._trace_modeled_power(self.start_date, terminate_date)
+      num_sectors_to_terminate = qa_active_power * constants.PIB / constants.SECTOR_SIZE
+      if num_sectors_to_terminate != 0:
+        termination_fee = termination_fee/num_sectors_to_terminate
+      else:
+        termination_fee = 0
+
+      return rb_active_power, qa_active_power, termination_fee
+
+    def estimate_utility_from_termination(self, date_in):     
+      terminate_date = self.current_date
+      # rb_active_power, qa_active_power, termination_fee, associated_pledge_to_release, date_to_release = self._trace_modeled_power(self.start_date, terminate_date)
+      rb_active_power, qa_active_power, termination_fee = self.get_termination_fee(date_in)
+      termination_fee_fiat = 4.5*termination_fee
+
+      # print('termination fee {}'.format(str(termination_fee)))
+      # print('termination fee fiat {}'.format(str(termination_fee_fiat)))
+
+      salvage_value = 4.5*((1/4)*(0.4))
+      utility_estimate = salvage_value - termination_fee_fiat
+
+      return (utility_estimate)
+
+    def estimate_utility_from_no_termination(self, sector_duration, date_in):
+      filecoin_df_idx = self.model.filecoin_df[pd.to_datetime(self.model.filecoin_df['date']) == pd.to_datetime(date_in)].index[0]
+
+        # NOTE: we need to use yesterday's metrics b/c today's haven't yet been aggregated by the system yet
+      prev_day_pledge_per_QAP = self.model.filecoin_df.loc[filecoin_df_idx-1, 'day_pledge_per_QAP']
+
+        # print(date_in, 'prev_day_pledge_per_QAP', prev_day_pledge_per_QAP)
+
+        # TODO: make this an iterative update rather than full-estimate every day
+        # NOTE: this assumes that the pledge remains constant. This is not true, but a zeroth-order approximation
+      future_rewards_per_sector_estimate = self.forecast_day_rewards_per_sector(date_in, sector_duration)
         
-      total_current_rb_active_power = agent_at_terminate_date_stats['cum_cc_onboarded'] + agent_at_terminate_date_stats['cum_cc_renewed'] - agent_at_terminate_date_stats['cum_cc_sched_expire'] - agent_at_terminate_date_stats['cum_cc_terminated']
-      total_current_qa_active_power = agent_at_terminate_date_stats['cum_deal_onboarded'] + agent_at_terminate_date_stats['cum_deal_renewed'] - agent_at_terminate_date_stats['cum_deal_sched_expire'] - agent_at_terminate_date_stats['cum_deal_terminated']
-      num_sectors_to_terminate = total_current_qa_active_power * constants.PIB / constants.SECTOR_SIZE
+        # get the cost per sector for the duration, which in this case is just borrowing costs
+      sector_duration_yrs = sector_duration / 360.
+      pledge_repayment_estimate = self.compute_repayment_amount_from_supply_discount_rate_model(date_in, prev_day_pledge_per_QAP, sector_duration_yrs)
+      cost_per_sector_estimate = pledge_repayment_estimate - prev_day_pledge_per_QAP
+      
+      utility_estimate = (future_rewards_per_sector_estimate.sum() - cost_per_sector_estimate)
+      utility_estimate = 10*utility_estimate
 
-      known_power_onboarding_date_approx = constants.NETWORK_DATA_START
-      filecoin_df_idx = self.model.filecoin_df[pd.to_datetime(self.model.filecoin_df['date']) == pd.to_datetime(known_power_onboarding_date_approx)].index[0]
-      rewards_per_sector_during_onboarding = self.model.filecoin_df.loc[filecoin_df_idx, 'day_rewards_per_sector']
-      termination_fee = int(rewards_per_sector_during_onboarding * num_sectors_to_terminate * 90)
-
-      _, agentid2powerproportion = self.model._get_agent_power_proportion(update_day=self.current_day-1)  # havent aggregated today's decisions yet
-      total_locked_at_terminate_date = self.model.filecoin_df[pd.to_datetime(self.model.filecoin_df['date']) == pd.to_datetime(terminate_date_m1)]['network_locked'].values[0] * agentid2powerproportion[self.unique_id]
-
-      salvage_value = 1/4 * 0.4
-
-      return (salvage_value - termination_fee)/total_locked_at_terminate_date
+      return utility_estimate
 
     def convert_roi_to_onboard(self, estimated_roi):
         """
@@ -328,81 +363,75 @@ class ROIAgentDynamicOnboardandTerminate(SPAgent):
         return rb_to_onboard, renew_pct
 
     def step(self):
-        
-        roi_compute_duration_yrs =  1
-        roi_compute_duration = 360*roi_compute_duration_yrs
+        # utility_compute_duration_yrs =  1
+        # utility_compute_duration = 360*utility_compute_duration_yrs
 
-        roi_from_termination = self.estimate_roi_from_termination(self.current_date)
-        roi_from_no_termination = self.estimate_roi(roi_compute_duration, self.current_date) 
-        if roi_from_termination/roi_from_no_termination > 1:
-          self.terminate_date = self.current_date
+        # utility_from_termination = self.estimate_utility_from_termination(self.current_date)
+        # utility_from_no_termination = self.estimate_utility_from_no_termination(utility_compute_duration, self.current_date) 
 
-        if self.terminate_date is not None and self.current_date == self.terminate_date:
-          self.terminate_all_modeled_power(self.current_date)
-          self.terminate_all_known_power(self.current_date)
-        elif self.terminate_date is not None and self.current_date > self.terminate_date:
-            # we stop onboarding and renewing power after this date
-            pass
-        
-        else:
-          roi_estimate_vec = []
-        
-          agent_df_idx = self.agent_info_df[pd.to_datetime(self.agent_info_df['date']) == pd.to_datetime(self.current_date)].index[0]
-          for d in self.duration_vec_days:    
-              roi_estimate = self.estimate_roi(d, self.current_date)            
-              roi_estimate_vec.append(roi_estimate)
-              self.agent_info_df.loc[agent_df_idx, 'roi_estimate_%d' % (d,)] = roi_estimate
-            
-          max_roi_idx = np.argmax(roi_estimate_vec)
-          best_duration = self.duration_vec_days[max_roi_idx]
-          best_duration_yrs = best_duration / 360.
-          if roi_estimate_vec[max_roi_idx] > self.min_roi:
-              rb_to_onboard, renewal_rate = self.convert_roi_to_onboard(roi_estimate_vec[max_roi_idx])
-            # clip the values to the min/max
-              rb_to_onboard = max(min(rb_to_onboard, self.max_daily_rb_onboard_pib), self.min_daily_rb_onboard_pib)
-              renewal_rate = max(min(renewal_rate, self.max_renewal_rate), self.min_renewal_rate)
-            
-              qa_to_onboard = self.model.apply_qa_multiplier(rb_to_onboard * self.fil_plus_rate,
+        # returns = self.get_returns(utility_compute_duration, self.current_date)
+        # rb_active_power, qa_active_power, termination_fee = self.get_termination_fee(self.current_date)
+
+        if self.terminate_date is not None and self.current_date > self.terminate_date:
+          pass
+        elif self.terminate_date == None:
+          utility_compute_duration_yrs =  1
+          utility_compute_duration = 360*utility_compute_duration_yrs
+
+          utility_from_termination = self.estimate_utility_from_termination(self.current_date)
+          utility_from_no_termination = self.estimate_utility_from_no_termination(utility_compute_duration, self.current_date) 
+
+          returns = self.get_returns(utility_compute_duration, self.current_date)
+          rb_active_power, qa_active_power, termination_fee = self.get_termination_fee(self.current_date)
+          if (utility_from_termination > utility_from_no_termination) and (self.current_date >= (self.start_date + timedelta(days=180))):
+            self.terminate_date = self.current_date
+            print('Terminating Power')
+            self.terminate_all_modeled_power(self.current_date)
+            self.terminate_all_known_power(self.current_date)
+      
+          if ((termination_fee/returns) < 1) and (self.terminate_date == None):
+            print('Onboarding Power')
+            rb_to_onboard = min(self.max_daily_rb_onboard_pib, self.max_sealing_throughput_pib)
+            qa_to_onboard = self.model.apply_qa_multiplier(rb_to_onboard * self.fil_plus_rate,
                                                        fil_plus_multipler=constants.FIL_PLUS_MULTIPLER,
                                                        date_in=self.current_date,
-                                                       sector_duration_days=best_duration) + \
+                                                       sector_duration_days=self.sector_duration) + \
                         rb_to_onboard * (1-self.fil_plus_rate)
-              pledge_per_pib = self.model.estimate_pledge_for_qa_power(self.current_date, 1.0)
+            pledge_per_pib = self.model.estimate_pledge_for_qa_power(self.current_date, 1.0)
 
-              pledge_needed_for_onboarding = qa_to_onboard * pledge_per_pib
-              pledge_repayment_value_onboard = self.compute_repayment_amount_from_supply_discount_rate_model(self.current_date, 
-                                                                                                        pledge_needed_for_onboarding, 
-                                                                                                        best_duration_yrs)
+            pledge_needed_for_onboarding = qa_to_onboard * pledge_per_pib
+            pledge_repayment_value_onboard = self.compute_repayment_amount_from_supply_discount_rate_model(self.current_date, 
+                                                                                                       pledge_needed_for_onboarding, 
+                                                                                                       self.sector_duration_yrs)
+            if not self.debug_mode:
+              self.onboard_power(self.current_date, rb_to_onboard, qa_to_onboard, self.sector_duration, 
+                               pledge_needed_for_onboarding, pledge_repayment_value_onboard)
+            else:
+              onboard_args_to_return = (self.current_date, rb_to_onboard, qa_to_onboard, self.sector_duration, 
+                                      pledge_needed_for_onboarding, pledge_repayment_value_onboard)
 
-              if not self.debug_mode:
-                  self.onboard_power(self.current_date, rb_to_onboard, qa_to_onboard, best_duration,
-                                pledge_needed_for_onboarding, pledge_repayment_value_onboard)
-              else:
-                  onboard_args_to_return = (self.current_date, rb_to_onboard, qa_to_onboard, best_duration, 
-                                          pledge_needed_for_onboarding, pledge_repayment_value_onboard)
-
-              # renew available power for the same duration
+            if self.renewal_rate > 0:
               se_power_dict = self.get_se_power_at_date(self.current_date)
-              # which aspects of power get renewed is dependent on the setting "renewals_setting" in the FilecoinModel object
-              cc_power_to_renew = se_power_dict['se_cc_power'] * renewal_rate
-              deal_power_to_renew = se_power_dict['se_deal_power'] * renewal_rate
+            # which aspects of power get renewed is dependent on the setting "renewals_setting" in the FilecoinModel object
+              cc_power = se_power_dict['se_cc_power']
+              deal_power = se_power_dict['se_deal_power']
+              cc_power_to_renew = cc_power*self.renewal_rate 
+              deal_power_to_renew = deal_power*self.renewal_rate  
 
               pledge_needed_for_renewal = (cc_power_to_renew + deal_power_to_renew) * pledge_per_pib
               pledge_repayment_value_renew = self.compute_repayment_amount_from_supply_discount_rate_model(self.current_date, 
-                                                                                                        pledge_needed_for_renewal, 
-                                                                                                        best_duration_yrs)
+                                                                                                         pledge_needed_for_renewal, 
+                                                                                                         self.sector_duration_yrs)
 
               if not self.debug_mode:
-                  self.renew_power(self.current_date, cc_power_to_renew, deal_power_to_renew, best_duration,
+                  self.renew_power(self.current_date, cc_power_to_renew, deal_power_to_renew, self.sector_duration,
                                 pledge_needed_for_renewal, pledge_repayment_value_renew)
               else:
-                  renew_args_to_return = (self.current_date, cc_power_to_renew, deal_power_to_renew, best_duration,
+                  renew_args_to_return = (self.current_date, cc_power_to_renew, deal_power_to_renew, self.sector_duration,
                                         pledge_needed_for_renewal, pledge_repayment_value_renew)
 
         # even if we are in debug mode, we need to step the agent b/c that updates agent internal states
         # such as current_date
-        # grandparent = super(self.__class__, self).__class__.__bases__[0]
-        # grandparent.step()
         super().step()
 
         if self.debug_mode:

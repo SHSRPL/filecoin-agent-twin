@@ -182,10 +182,10 @@ class ROIAgentDynamicOnboardandTerminateWaves(SPAgent):
         
         # get the cost per sector for the duration, which in this case is just borrowing costs
       sector_duration_yrs = sector_duration / 360.
-      pledge_repayment_estimate = self.compute_repayment_amount_from_supply_discount_rate_model(date_in, prev_day_pledge_per_QAP, sector_duration_yrs)
-      cost_per_sector_estimate = pledge_repayment_estimate - prev_day_pledge_per_QAP
+      # pledge_repayment_estimate = self.compute_repayment_amount_from_supply_discount_rate_model(date_in, prev_day_pledge_per_QAP, sector_duration_yrs)
+      # cost_per_sector_estimate = pledge_repayment_estimate - prev_day_pledge_per_QAP
       
-      utility_estimate = (future_rewards_per_sector_estimate.sum() - cost_per_sector_estimate)
+      utility_estimate = future_rewards_per_sector_estimate.sum() 
       if self.future_exchange_rate == 1000000000:
         utility_estimate = 1000000000
       else:
@@ -225,7 +225,8 @@ class ROIAgentDynamicOnboardandTerminateWaves(SPAgent):
           rb_active_power, qa_active_power, termination_fee = self.get_termination_fee(self.current_date)
           if (utility_from_termination > utility_from_no_termination) and (self.current_date >= (self.start_date + timedelta(days=180))):
             self.terminate_date = self.current_date
-            print('Terminating Power')
+            print('U1 {}'.format(str(utility_from_termination)))
+            print('U2 {}'.format(str(utility_from_no_termination)))
             self.terminate_all_modeled_power(self.current_date)
             self.terminate_all_known_power(self.current_date)
       
